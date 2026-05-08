@@ -1,12 +1,8 @@
-#!/usr/bin/env python3
-"""aclspider — Spider SMB shares and report directories with interesting ACLs."""
-
 import argparse
+import contextlib
 import ntpath
 import os
 import sys
-import traceback
-from typing import Optional
 
 from impacket.dcerpc.v5 import lsad, lsat, rpcrt, samr, srvs, transport
 from impacket.dcerpc.v5.dtypes import MAXIMUM_ALLOWED
@@ -24,15 +20,15 @@ from impacket.smb3structs import (
     SMB2_0_INFO_SECURITY,
     SMB2_SEC_INFO_00,
 )
-from impacket.smbconnection import SMBConnection, SessionError
+from impacket.smbconnection import SessionError, SMBConnection
 
 # SIDs that are always expected/boring on Windows shares
 SKIP_SIDS = {
-    "S-1-5-18",      # SYSTEM
+    "S-1-5-18",  # SYSTEM
     "S-1-5-32-544",  # BUILTIN\Administrators
-    "S-1-3-0",       # CREATOR OWNER
-    "S-1-3-4",       # CREATOR OWNER SERVER
-    "S-1-1-0",       # Everyone
+    "S-1-3-0",  # CREATOR OWNER
+    "S-1-3-4",  # CREATOR OWNER SERVER
+    "S-1-1-0",  # Everyone
 }
 
 # Permission bits indicating write capability for directories
@@ -57,27 +53,27 @@ ALL_DIR_MASKS = [
 ]
 
 GENERIC_FLAGS = [
-    ("GENERIC_READ",          0x80000000),
-    ("GENERIC_WRITE",         0x40000000),
-    ("GENERIC_EXECUTE",       0x20000000),
-    ("GENERIC_ALL",           0x10000000),
-    ("MAXIMUM_ALLOWED",       0x02000000),
-    ("ACCESS_SYSTEM_SECURITY",0x01000000),
-    ("WRITE_OWNER",           0x00080000),
-    ("WRITE_DACL",            0x00040000),
-    ("DELETE",                0x00010000),
-    ("READ_CONTROL",          0x00020000),
-    ("SYNCHRONIZE",           0x00100000),
+    ("GENERIC_READ", 0x80000000),
+    ("GENERIC_WRITE", 0x40000000),
+    ("GENERIC_EXECUTE", 0x20000000),
+    ("GENERIC_ALL", 0x10000000),
+    ("MAXIMUM_ALLOWED", 0x02000000),
+    ("ACCESS_SYSTEM_SECURITY", 0x01000000),
+    ("WRITE_OWNER", 0x00080000),
+    ("WRITE_DACL", 0x00040000),
+    ("DELETE", 0x00010000),
+    ("READ_CONTROL", 0x00020000),
+    ("SYNCHRONIZE", 0x00100000),
 ]
 
 WRITE_GENERIC = {"GENERIC_WRITE", "GENERIC_ALL", "MAXIMUM_ALLOWED", "WRITE_OWNER", "WRITE_DACL", "DELETE"}
 
-ANSI_BOLD   = "\x1b[1m"
-ANSI_RED    = "\x1b[91m"
+ANSI_BOLD = "\x1b[1m"
+ANSI_RED = "\x1b[91m"
 ANSI_YELLOW = "\x1b[93m"
-ANSI_GREEN  = "\x1b[92m"
-ANSI_CYAN   = "\x1b[96m"
-ANSI_RESET  = "\x1b[0m"
+ANSI_GREEN = "\x1b[92m"
+ANSI_CYAN = "\x1b[96m"
+ANSI_RESET = "\x1b[0m"
 
 
 def bold(s: str, color: bool = True) -> str:
@@ -125,7 +121,9 @@ class SIDResolver:
             policy = self._open_policy()
             try:
                 resp = lsat.hLsarLookupSids(
-                    self._dce, policy, unresolved,
+                    self._dce,
+                    policy,
+                    unresolved,
                     lsat.LSAP_LOOKUP_LEVEL.LsapLookupWksta,
                 )
             except DCERPCSessionError as e:
@@ -171,7 +169,7 @@ class SIDResolver:
         return self.cache.get(sid, sid)
 
 
-def connect_smb(args) -> Optional[SMBConnection]:
+def connect_smb(args) -> SMBConnection | None:
     try:
         conn = SMBConnection(
             remoteName=args.host,
@@ -283,15 +281,17 @@ def get_user_groups_samr(conn: SMBConnection, domain: str, username: str, verbos
         samr.hSamrCloseHandle(dce, user_handle)
 
         # Get local alias memberships (BUILTIN groups etc.)
-        resp = samr.hSamrOpenDomain(dce, server_handle, domainId=samr.hSamrLookupDomainInSamServer(dce, server_handle, "Builtin")["DomainId"])
+        resp = samr.hSamrOpenDomain(
+            dce, server_handle, domainId=samr.hSamrLookupDomainInSamServer(dce, server_handle, "Builtin")["DomainId"]
+        )
         builtin_handle = resp["DomainHandle"]
 
         user_sid_obj = samr.RPC_SID()
         user_sid_obj.fromCanonical(user_sid)
         try:
-            resp = samr.hSamrGetAliasMembership(dce, builtin_handle, [user_sid_obj] + [
-                samr.RPC_SID().fromCanonical(s) or s for s in sids[1:]
-            ])
+            resp = samr.hSamrGetAliasMembership(
+                dce, builtin_handle, [user_sid_obj] + [samr.RPC_SID().fromCanonical(s) or s for s in sids[1:]]
+            )
             builtin_sid = samr.hSamrLookupDomainInSamServer(dce, server_handle, "Builtin")["DomainId"].formatCanonical()
             for rid in resp["Membership"]["Element"]:
                 sids.append(f"{builtin_sid}-{rid['Data']}")
@@ -322,7 +322,7 @@ def get_user_groups_samr(conn: SMBConnection, domain: str, username: str, verbos
     return list(set(sids))
 
 
-def get_acl(conn: SMBConnection, share: str, path: str, is_dir: bool) -> Optional[bytes]:
+def get_acl(conn: SMBConnection, share: str, path: str, is_dir: bool) -> bytes | None:
     """Fetch the security descriptor for a file/dir. Returns raw bytes or None."""
     try:
         tree_id = conn.connectTree(share)
@@ -340,9 +340,7 @@ def get_acl(conn: SMBConnection, share: str, path: str, is_dir: bool) -> Optiona
             file_id,
             infoType=SMB2_0_INFO_SECURITY,
             fileInfoClass=SMB2_SEC_INFO_00,
-            additionalInformation=(
-                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION
-            ),
+            additionalInformation=(OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION),
             flags=0,
         )
         conn.getSMBServer().close(tree_id, file_id)
@@ -371,22 +369,24 @@ def parse_acl(raw: bytes, is_dir: bool) -> list[dict]:
         except Exception:
             ace_type = "ACCESS_ALLOWED_ACE"
         mask_val = 0
-        try:
+        with contextlib.suppress(Exception):
             mask_val = ace["Ace"]["Mask"]["Mask"]
-        except Exception:
-            pass
 
         flags = []
-        masks = ALL_DIR_MASKS if is_dir else [
-            (0x0001, "FILE_READ_DATA"),
-            (0x0002, "FILE_WRITE_DATA"),
-            (0x0004, "FILE_APPEND_DATA"),
-            (0x0008, "FILE_READ_EA"),
-            (0x0010, "FILE_WRITE_EA"),
-            (0x0020, "FILE_EXECUTE"),
-            (0x0080, "FILE_READ_ATTRIBUTES"),
-            (0x0100, "FILE_WRITE_ATTRIBUTES"),
-        ]
+        masks = (
+            ALL_DIR_MASKS
+            if is_dir
+            else [
+                (0x0001, "FILE_READ_DATA"),
+                (0x0002, "FILE_WRITE_DATA"),
+                (0x0004, "FILE_APPEND_DATA"),
+                (0x0008, "FILE_READ_EA"),
+                (0x0010, "FILE_WRITE_EA"),
+                (0x0020, "FILE_EXECUTE"),
+                (0x0080, "FILE_READ_ATTRIBUTES"),
+                (0x0100, "FILE_WRITE_ATTRIBUTES"),
+            ]
+        )
         for bit, name in masks:
             if mask_val & bit:
                 flags.append(name)
@@ -395,12 +395,14 @@ def parse_acl(raw: bytes, is_dir: bool) -> list[dict]:
                 flags.append(name)
 
         if flags:
-            aces.append({
-                "sid": sid,
-                "type": ace_type,
-                "flags": flags,
-                "mask": mask_val,
-            })
+            aces.append(
+                {
+                    "sid": sid,
+                    "type": ace_type,
+                    "flags": flags,
+                    "mask": mask_val,
+                }
+            )
     return aces
 
 
@@ -421,7 +423,9 @@ def list_shares(conn: SMBConnection) -> list[str]:
 
 def test_write_access(conn: SMBConnection, share: str, path: str) -> bool:
     """Attempt to create and immediately delete a temp file. Returns True if write succeeded."""
-    import random, string
+    import random
+    import string
+
     name = "~aclspider_" + "".join(random.choices(string.ascii_lowercase, k=6)) + ".tmp"
     remote_path = ntpath.join(path, name) if path else name
     try:
@@ -434,10 +438,10 @@ def test_write_access(conn: SMBConnection, share: str, path: str) -> bool:
             tree_id,
             remote_path,
             0x40000000 | 0x00010000,  # GENERIC_WRITE | DELETE
-            0,                         # no sharing
+            0,  # no sharing
             0x00000040 | 0x00001000,  # FILE_NON_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE
-            2,                         # FILE_CREATE
-            0x80,                      # FILE_ATTRIBUTE_NORMAL
+            2,  # FILE_CREATE
+            0x80,  # FILE_ATTRIBUTE_NORMAL
         )
         smb.close(tree_id, fid)
         return True
@@ -462,10 +466,10 @@ def connect_srvsvc(conn: SMBConnection):
         return None
 
 
-def get_share_acl_raw(dce_srvsvc, host: str, share_name: str) -> Optional[bytes]:
+def get_share_acl_raw(dce_srvsvc, host: str, share_name: str) -> bytes | None:
     """Fetch the share-level security descriptor via SRVSVC NetShareGetInfo level 502."""
     try:
-        resp = srvs.hNetrShareGetInfo(dce_srvsvc, f"\\\\{host}", share_name, 502)
+        resp = srvs.hNetrShareGetInfo(dce_srvsvc, share_name, 502)
         sd_data = resp["InfoStruct"]["ShareInfo502"]["shi502_security_descriptor"]
         # sd_data is an NDR array; join its bytes
         raw = b"".join(bytes([b]) for b in sd_data)
@@ -474,7 +478,7 @@ def get_share_acl_raw(dce_srvsvc, host: str, share_name: str) -> Optional[bytes]
         return None
 
 
-def walk_share(conn: SMBConnection, share: str, path: str = "", depth: int = 0, max_depth: Optional[int] = None):
+def walk_share(conn: SMBConnection, share: str, path: str = "", depth: int = 0, max_depth: int | None = None):
     """Yield (full_path, is_dir) for all entries under path in share, recursively."""
     if max_depth is not None and depth > max_depth:
         return
@@ -506,10 +510,7 @@ def format_ace(ace: dict, resolved: str, is_write: bool, color: bool) -> str:
     flags_str = " | ".join(ace["flags"])
     if color:
         name = bold(resolved, color)
-        if is_write:
-            flags_str = red(flags_str, color)
-        else:
-            flags_str = flags_str
+        flags_str = red(flags_str, color) if is_write else flags_str
         return f"    {perm_type}: {name}  {flags_str}"
     return f"    {perm_type}: {resolved}  {flags_str}"
 
@@ -538,7 +539,7 @@ def run_spider(args):
                 resolver.resolve_sids(set(samr_sids))
                 resolved_names = [resolver.get(s) for s in samr_sids]
                 print(f"[*] Current user groups ({len(samr_sids)}):")
-                for s, n in zip(samr_sids, resolved_names):
+                for s, n in zip(samr_sids, resolved_names, strict=False):
                     print(f"    {n} ({s})")
 
         # Add manually specified groups
@@ -577,17 +578,18 @@ def run_spider(args):
 
     for share in shares:
         # --- Share-level ACL ---
-        share_write_sids: set[str] = set()   # SIDs that have write at share level
         share_read_only_sids: set[str] = set()  # SIDs with only read at share level
-        share_acl_note = ""
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"  Share: {cyan(share, color)}")
-        print(f"  NOTE: only NTFS ACLs shown — use --test-write to confirm actual write access")
-        print(f"{'='*60}")
+        print("  NOTE: only NTFS ACLs shown — use --test-write to confirm actual write access")
+        print(f"{'=' * 60}")
 
-        paths_to_check = [(path, is_dir) for path, is_dir in walk_share(conn, share, max_depth=args.depth)
-                          if is_dir or args.include_files]
+        paths_to_check = [
+            (path, is_dir)
+            for path, is_dir in walk_share(conn, share, max_depth=args.depth)
+            if is_dir or args.include_files
+        ]
 
         # Always include root of share
         paths_to_check = [("", True)] + paths_to_check
@@ -618,9 +620,8 @@ def run_spider(args):
                     continue
 
                 # If filtering by user, skip ACEs not relevant to the user
-                if user_sids and not args.no_filter:
-                    if not sid_matches(sid, user_sids):
-                        continue
+                if user_sids and not args.no_filter and not sid_matches(sid, user_sids):
+                    continue
 
                 # If write-only mode, skip read-only ACEs
                 if args.write_only and not is_write:
@@ -689,16 +690,19 @@ Examples:
     parser.add_argument("--depth", type=int, default=None, help="Max recursion depth (default: unlimited)")
     parser.add_argument("--include-files", action="store_true", help="Also check ACLs on files (slow)")
 
-    parser.add_argument("--groups", nargs="+", metavar="NAME",
-                        help="Additional group names to include in filter (e.g. 'IT Support')")
-    parser.add_argument("--no-filter", action="store_true",
-                        help="Show all non-admin ACEs regardless of current user")
-    parser.add_argument("--skip-samr", action="store_true",
-                        help="Skip SAMR group enumeration (use --groups for manual input)")
-    parser.add_argument("--write-only", action="store_true",
-                        help="Only report ACEs that grant write-like permissions")
-    parser.add_argument("--test-write", action="store_true",
-                        help="Empirically test write access by creating+deleting a temp file (confirms share-level blocks)")
+    parser.add_argument(
+        "--groups", nargs="+", metavar="NAME", help="Additional group names to include in filter (e.g. 'IT Support')"
+    )
+    parser.add_argument("--no-filter", action="store_true", help="Show all non-admin ACEs regardless of current user")
+    parser.add_argument(
+        "--skip-samr", action="store_true", help="Skip SAMR group enumeration (use --groups for manual input)"
+    )
+    parser.add_argument("--write-only", action="store_true", help="Only report ACEs that grant write-like permissions")
+    parser.add_argument(
+        "--test-write",
+        action="store_true",
+        help="Empirically test write access by creating+deleting a temp file (confirms share-level blocks)",
+    )
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI color output")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
 

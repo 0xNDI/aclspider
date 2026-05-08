@@ -2,10 +2,28 @@
 name = "aclspider"
 version = "0.1.0"
 description = "Spider SMB shares and report directories with non-standard ACLs"
-requires-python = ">=3.9"
+requires-python = ">=3.13"
 dependencies = [
     "impacket>=0.10.0",
 ]
 
 [project.scripts]
 aclspider = "aclspider.main:main"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.6",
+    "ty>=0.0.23",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP", "SIM"]
+ignore = ["E501"]
