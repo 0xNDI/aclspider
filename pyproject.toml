@@ -1,0 +1,11 @@
+[project]
+name = "aclspider"
+version = "0.1.0"
+description = "Spider SMB shares and report directories with non-standard ACLs"
+requires-python = ">=3.9"
+dependencies = [
+    "impacket>=0.10.0",
+]
+
+[project.scripts]
+aclspider = "aclspider.main:main"
