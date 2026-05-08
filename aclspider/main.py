@@ -1,4 +1,5 @@
 import argparse
+import json
 import ntpath
 import os
 import random
@@ -468,44 +469,51 @@ def format_ace(ace: dict, resolved: str, is_write: bool, color: bool) -> str:
 
 
 def run_spider(args):
-    color = not args.no_color
+    color = not args.no_color and not args.json
 
     conn = connect_smb(args)
     if conn is None:
         sys.exit(1)
 
-    print(f"[+] Authenticated as {args.domain}\\{args.username} on {args.host}")
+    if not args.json:
+        print(f"[+] Authenticated as {args.domain}\\{args.username} on {args.host}")
 
     resolver = SIDResolver(conn)
 
     user_sids: set[str] = set()
     if args.username and not args.no_filter:
         if not args.skip_samr:
-            print("[*] Enumerating group memberships via SAMR ...")
+            if not args.json:
+                print("[*] Enumerating group memberships via SAMR ...")
             samr_sids = get_user_groups_samr(conn, args.domain or "", args.username, verbose=args.verbose)
             if samr_sids:
                 user_sids.update(samr_sids)
                 resolver.resolve_sids(set(samr_sids))
-                resolved_names = [resolver.get(s) for s in samr_sids]
-                print(f"[*] Current user groups ({len(samr_sids)}):")
-                for s, n in zip(samr_sids, resolved_names, strict=False):
-                    print(f"    {n} ({s})")
+                if not args.json:
+                    resolved_names = [resolver.get(s) for s in samr_sids]
+                    print(f"[*] Current user groups ({len(samr_sids)}):")
+                    for s, n in zip(samr_sids, resolved_names, strict=False):
+                        print(f"    {n} ({s})")
 
         if args.groups:
-            print(f"[*] Resolving {len(args.groups)} manually specified group(s) ...")
+            if not args.json:
+                print(f"[*] Resolving {len(args.groups)} manually specified group(s) ...")
             name_to_sid = resolver.lookup_names(args.groups)
             for gname, gsid in name_to_sid.items():
                 user_sids.add(gsid)
                 resolver.cache[gsid] = gname
-                print(f"    {gname} -> {gsid}")
-            for gname in args.groups:
-                if gname not in name_to_sid:
-                    print(f"    [!] Could not resolve: {gname}")
+                if not args.json:
+                    print(f"    {gname} -> {gsid}")
+            if not args.json:
+                for gname in args.groups:
+                    if gname not in name_to_sid:
+                        print(f"    [!] Could not resolve: {gname}")
 
     if args.shares:
         shares = args.shares
     else:
-        print("[*] Enumerating shares ...")
+        if not args.json:
+            print("[*] Enumerating shares ...")
         shares = list_shares(conn)
         if not shares:
             print("[-] No shares found or access denied", file=sys.stderr)
@@ -513,9 +521,11 @@ def run_spider(args):
         if not args.all_shares:
             shares = [s for s in shares if not s.upper().endswith("$") or s.upper() in ("SYSVOL", "NETLOGON", "IPC$")]
             shares = [s for s in shares if s.upper() != "IPC$"]
-        print(f"[*] Scanning {len(shares)} share(s): {', '.join(shares)}")
+        if not args.json:
+            print(f"[*] Scanning {len(shares)} share(s): {', '.join(shares)}")
 
     found_any = False
+    findings: list[dict] = []
 
     for share in shares:
         share_printed = False
@@ -560,23 +570,45 @@ def run_spider(args):
                 interesting_aces.append((ace, resolved, is_write))
 
             if interesting_aces:
-                write_badge = ""
+                write_confirmed: bool | None = None
                 if args.test_write and is_dir and any(iw for _, _, iw in interesting_aces):
                     if test_write_access(conn, share, path):
-                        write_badge = f"  {green('[WRITE CONFIRMED]', color)}"
+                        write_confirmed = True
                     else:
                         continue
                 found_any = True
-                if not share_printed:
-                    print(f"\n{'=' * 60}")
-                    print(f"  Share: {cyan(share, color)}")
-                    print(f"{'=' * 60}")
-                    share_printed = True
-                print(f"\n  {bold(display_path, color)}{write_badge}")
-                for ace, resolved, is_write in interesting_aces:
-                    print(format_ace(ace, resolved, is_write, color))
+                if args.json:
+                    entry: dict = {
+                        "share": share,
+                        "path": display_path,
+                        "aces": [
+                            {
+                                "sid": ace["sid"],
+                                "name": resolved,
+                                "type": "allowed" if ace["type"] == "ACCESS_ALLOWED_ACE" else "denied",
+                                "permissions": ace["flags"],
+                                "write": is_write,
+                            }
+                            for ace, resolved, is_write in interesting_aces
+                        ],
+                    }
+                    if args.test_write:
+                        entry["write_confirmed"] = write_confirmed
+                    findings.append(entry)
+                else:
+                    write_badge = f"  {green('[WRITE CONFIRMED]', color)}" if write_confirmed else ""
+                    if not share_printed:
+                        print(f"\n{'=' * 60}")
+                        print(f"  Share: {cyan(share, color)}")
+                        print(f"{'=' * 60}")
+                        share_printed = True
+                    print(f"\n  {bold(display_path, color)}{write_badge}")
+                    for ace, resolved, is_write in interesting_aces:
+                        print(format_ace(ace, resolved, is_write, color))
 
-    if not found_any:
+    if args.json:
+        print(json.dumps(findings, indent=2))
+    elif not found_any:
         print("\n[-] No interesting ACLs found with current filters.")
         if user_sids:
             print("    Tip: try --no-filter to show all non-admin ACEs, or --write-only to focus on writes.")
@@ -632,6 +664,7 @@ Examples:
         help="Empirically test write access by creating+deleting a temp file (confirms share-level blocks)",
     )
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI color output")
+    parser.add_argument("--json", action="store_true", help="Output findings as JSON (suppresses all other output)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
 
     args = parser.parse_args()
