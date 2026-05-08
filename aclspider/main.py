@@ -518,10 +518,7 @@ def run_spider(args):
     found_any = False
 
     for share in shares:
-        print(f"\n{'=' * 60}")
-        print(f"  Share: {cyan(share, color)}")
-        print("  NOTE: only NTFS ACLs shown — use --test-write to confirm actual write access")
-        print(f"{'=' * 60}")
+        share_printed = False
 
         paths_to_check = [
             (path, is_dir)
@@ -563,14 +560,18 @@ def run_spider(args):
                 interesting_aces.append((ace, resolved, is_write))
 
             if interesting_aces:
-                found_any = True
                 write_badge = ""
                 if args.test_write and is_dir and any(iw for _, _, iw in interesting_aces):
-                    actually_writable = test_write_access(conn, share, path)
-                    if actually_writable:
+                    if test_write_access(conn, share, path):
                         write_badge = f"  {green('[WRITE CONFIRMED]', color)}"
                     else:
-                        write_badge = f"  {yellow('[write BLOCKED — likely share-level ACL]', color)}"
+                        continue
+                found_any = True
+                if not share_printed:
+                    print(f"\n{'=' * 60}")
+                    print(f"  Share: {cyan(share, color)}")
+                    print(f"{'=' * 60}")
+                    share_printed = True
                 print(f"\n  {bold(display_path, color)}{write_badge}")
                 for ace, resolved, is_write in interesting_aces:
                     print(format_ace(ace, resolved, is_write, color))
