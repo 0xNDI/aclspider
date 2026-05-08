@@ -31,6 +31,13 @@ SKIP_SIDS = {
     "S-1-1-0",  # Everyone
 }
 
+SKIP_DOMAIN_RIDS = {
+    "512",  # Domain Admins
+    "518",  # Schema Admins
+    "519",  # Enterprise Admins
+    "520",  # Group Policy Creator Owners
+}
+
 WRITE_DIR_MASKS = [
     (0x0002, "FILE_ADD_FILE"),
     (0x0004, "FILE_ADD_SUBDIRECTORY"),
@@ -544,7 +551,7 @@ def run_spider(args):
                 resolved = resolver.get(sid)
                 is_write = is_write_ace(ace)
 
-                if sid in SKIP_SIDS:
+                if sid in SKIP_SIDS or sid.split("-")[-1] in SKIP_DOMAIN_RIDS:
                     continue
 
                 if user_sids and not args.no_filter and sid not in user_sids:
@@ -558,7 +565,7 @@ def run_spider(args):
             if interesting_aces:
                 found_any = True
                 write_badge = ""
-                if args.test_write and any(iw for _, _, iw in interesting_aces):
+                if args.test_write and is_dir and any(iw for _, _, iw in interesting_aces):
                     actually_writable = test_write_access(conn, share, path)
                     if actually_writable:
                         write_badge = f"  {green('[WRITE CONFIRMED]', color)}"
