@@ -1,10 +1,14 @@
 import argparse
+import itertools
 import json
 import ntpath
 import os
+import queue
 import random
 import string
 import sys
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 
 from impacket.dcerpc.v5 import lsad, lsat, rpcrt, samr, transport
 from impacket.dcerpc.v5.dtypes import MAXIMUM_ALLOWED
@@ -23,6 +27,18 @@ from impacket.smb3structs import (
     SMB2_SEC_INFO_00,
 )
 from impacket.smbconnection import SessionError, SMBConnection
+
+_tree_cache: dict[int, dict[str, int]] = {}
+
+
+def _get_tree(conn: SMBConnection, share: str) -> int:
+    cid = id(conn)
+    if cid not in _tree_cache:
+        _tree_cache[cid] = {}
+    if share not in _tree_cache[cid]:
+        _tree_cache[cid][share] = conn.connectTree(share)
+    return _tree_cache[cid][share]
+
 
 SKIP_SIDS = {
     "S-1-5-18",  # SYSTEM
@@ -322,7 +338,7 @@ def get_user_groups_samr(conn: SMBConnection, domain: str, username: str, verbos
 
 def get_acl(conn: SMBConnection, share: str, path: str, is_dir: bool) -> bytes | None:
     try:
-        tree_id = conn.connectTree(share)
+        tree_id = _get_tree(conn, share)
         file_id = conn.getSMBServer().create(
             tree_id,
             path,
@@ -421,7 +437,7 @@ def test_write_access(conn: SMBConnection, share: str, path: str) -> bool:
     name = "~aclspider_" + "".join(random.choices(string.ascii_lowercase, k=6)) + ".tmp"
     remote_path = ntpath.join(path, name) if path else name
     try:
-        tree_id = conn.connectTree(share)
+        tree_id = _get_tree(conn, share)
         smb = conn.getSMBServer()
         fid = smb.create(
             tree_id,
@@ -438,7 +454,14 @@ def test_write_access(conn: SMBConnection, share: str, path: str) -> bool:
         return False
 
 
-def walk_share(conn: SMBConnection, share: str, path: str = "", depth: int = 0, max_depth: int | None = None):
+def walk_share(
+    conn: SMBConnection,
+    share: str,
+    path: str = "",
+    depth: int = 0,
+    max_depth: int | None = None,
+    max_subdirs: int | None = None,
+):
     if max_depth is not None and depth > max_depth:
         return
     try:
@@ -447,15 +470,80 @@ def walk_share(conn: SMBConnection, share: str, path: str = "", depth: int = 0, 
     except Exception:
         return
 
+    dir_count = 0
     for entry in entries:
         name = entry.get_longname()
         if name in (".", ".."):
             continue
         full = ntpath.join(path, name) if path else name
         is_dir = entry.is_directory()
+        if is_dir:
+            if max_subdirs is not None and dir_count >= max_subdirs:
+                continue
+            dir_count += 1
         yield full, is_dir
         if is_dir:
-            yield from walk_share(conn, share, full, depth + 1, max_depth)
+            yield from walk_share(conn, share, full, depth + 1, max_depth, max_subdirs)
+
+
+class ConnPool:
+    def __init__(self, args: argparse.Namespace, size: int):
+        self._q: queue.Queue[SMBConnection] = queue.Queue()
+        self._size = 0
+        for _ in range(size):
+            conn = connect_smb(args)
+            if conn:
+                self._q.put(conn)
+                self._size += 1
+
+    def size(self) -> int:
+        return self._size
+
+    @contextmanager
+    def acquire(self):
+        conn = self._q.get()
+        try:
+            yield conn
+        finally:
+            self._q.put(conn)
+
+
+def _check_path(
+    pool: ConnPool,
+    share: str,
+    path: str,
+    is_dir: bool,
+    user_sids: frozenset[str],
+    no_filter: bool,
+    write_only: bool,
+    do_test_write: bool,
+) -> tuple[str, bool, list[dict], bool | None] | None:
+    with pool.acquire() as conn:
+        raw = get_acl(conn, share, path, is_dir)
+        if raw is None:
+            return None
+        aces = parse_acl(raw, is_dir)
+        if not aces:
+            return None
+        interesting: list[dict] = []
+        for ace in aces:
+            sid = ace["sid"]
+            if sid in SKIP_SIDS or sid.split("-")[-1] in SKIP_DOMAIN_RIDS:
+                continue
+            if user_sids and not no_filter and sid not in user_sids:
+                continue
+            if write_only and not is_write_ace(ace):
+                continue
+            interesting.append(ace)
+        if not interesting:
+            return None
+        write_confirmed: bool | None = None
+        if do_test_write and is_dir and any(is_write_ace(a) for a in interesting):
+            if test_write_access(conn, share, path):
+                write_confirmed = True
+            else:
+                return None
+        return path, is_dir, interesting, write_confirmed
 
 
 def format_ace(ace: dict, resolved: str, is_write: bool, color: bool) -> str:
@@ -477,6 +565,11 @@ def run_spider(args):
 
     if not args.json:
         print(f"[+] Authenticated as {args.domain}\\{args.username} on {args.host}")
+
+    pool = ConnPool(args, args.workers)
+    if pool.size() == 0:
+        print("[-] Failed to create worker connections", file=sys.stderr)
+        sys.exit(1)
 
     resolver = SIDResolver(conn)
 
@@ -527,84 +620,79 @@ def run_spider(args):
     found_any = False
     findings: list[dict] = []
 
+    max_depth = args.depth or None
+    max_subdirs = args.max_subdirs or None
+    fs_user_sids = frozenset(user_sids)
+
     for share in shares:
         share_printed = False
 
-        paths_to_check = [
-            (path, is_dir)
-            for path, is_dir in walk_share(conn, share, max_depth=args.depth)
-            if is_dir or args.include_files
-        ]
+        path_iter = itertools.chain(
+            [("", True)],
+            (
+                (p, d)
+                for p, d in walk_share(conn, share, max_depth=max_depth, max_subdirs=max_subdirs)
+                if d or args.include_files
+            ),
+        )
 
-        paths_to_check = [("", True)] + paths_to_check
+        share_results: list[tuple[str, bool, list[dict], bool | None]] = []
+        with ThreadPoolExecutor(max_workers=pool.size()) as executor:
+            future_map: dict[Future[tuple[str, bool, list[dict], bool | None] | None], None] = {}
+            for path, is_dir in path_iter:
+                f = executor.submit(
+                    _check_path,
+                    pool,
+                    share,
+                    path,
+                    is_dir,
+                    fs_user_sids,
+                    args.no_filter,
+                    args.write_only,
+                    args.test_write,
+                )
+                future_map[f] = None
+            for f in as_completed(future_map):
+                r = f.result()
+                if r is not None:
+                    share_results.append(r)
 
-        for path, is_dir in paths_to_check:
+        share_results.sort(key=lambda r: r[0].lower())
+
+        for path, _is_dir, raw_aces, write_confirmed in share_results:
+            found_any = True
             display_path = f"\\\\{args.host}\\{share}\\{path}" if path else f"\\\\{args.host}\\{share}"
+            resolver.resolve_sids({ace["sid"] for ace in raw_aces})
+            interesting_aces = [(ace, resolver.get(ace["sid"]), is_write_ace(ace)) for ace in raw_aces]
 
-            raw = get_acl(conn, share, path, is_dir)
-            if raw is None:
-                continue
-
-            aces = parse_acl(raw, is_dir)
-            if not aces:
-                continue
-
-            all_sids = {ace["sid"] for ace in aces}
-            resolver.resolve_sids(all_sids)
-
-            interesting_aces = []
-            for ace in aces:
-                sid = ace["sid"]
-                resolved = resolver.get(sid)
-                is_write = is_write_ace(ace)
-
-                if sid in SKIP_SIDS or sid.split("-")[-1] in SKIP_DOMAIN_RIDS:
-                    continue
-
-                if user_sids and not args.no_filter and sid not in user_sids:
-                    continue
-
-                if args.write_only and not is_write:
-                    continue
-
-                interesting_aces.append((ace, resolved, is_write))
-
-            if interesting_aces:
-                write_confirmed: bool | None = None
-                if args.test_write and is_dir and any(iw for _, _, iw in interesting_aces):
-                    if test_write_access(conn, share, path):
-                        write_confirmed = True
-                    else:
-                        continue
-                found_any = True
-                if args.json:
-                    entry: dict = {
-                        "share": share,
-                        "path": display_path,
-                        "aces": [
-                            {
-                                "sid": ace["sid"],
-                                "name": resolved,
-                                "type": "allowed" if ace["type"] == "ACCESS_ALLOWED_ACE" else "denied",
-                                "permissions": ace["flags"],
-                                "write": is_write,
-                            }
-                            for ace, resolved, is_write in interesting_aces
-                        ],
-                    }
-                    if args.test_write:
-                        entry["write_confirmed"] = write_confirmed
-                    findings.append(entry)
-                else:
-                    write_badge = f"  {green('[WRITE CONFIRMED]', color)}" if write_confirmed else ""
-                    if not share_printed:
-                        print(f"\n{'=' * 60}")
-                        print(f"  Share: {cyan(share, color)}")
-                        print(f"{'=' * 60}")
-                        share_printed = True
-                    print(f"\n  {bold(display_path, color)}{write_badge}")
-                    for ace, resolved, is_write in interesting_aces:
-                        print(format_ace(ace, resolved, is_write, color))
+            if args.json:
+                entry: dict = {
+                    "share": share,
+                    "path": display_path,
+                    "aces": [
+                        {
+                            "sid": ace["sid"],
+                            "name": resolved,
+                            "type": "allowed" if ace["type"] == "ACCESS_ALLOWED_ACE" else "denied",
+                            "permissions": ace["flags"],
+                            "write": iw,
+                        }
+                        for ace, resolved, iw in interesting_aces
+                    ],
+                }
+                if args.test_write:
+                    entry["write_confirmed"] = write_confirmed
+                findings.append(entry)
+            else:
+                write_badge = f"  {green('[WRITE CONFIRMED]', color)}" if write_confirmed else ""
+                if not share_printed:
+                    print(f"\n{'=' * 60}")
+                    print(f"  Share: {cyan(share, color)}")
+                    print(f"{'=' * 60}")
+                    share_printed = True
+                print(f"\n  {bold(display_path, color)}{write_badge}")
+                for ace, resolved, iw in interesting_aces:
+                    print(format_ace(ace, resolved, iw, color))
 
     if args.json:
         print(json.dumps(findings, indent=2))
@@ -645,9 +733,16 @@ Examples:
     parser.add_argument("--ccache", default=None, help="Path to Kerberos ccache file")
     parser.add_argument("--port", default=445, type=int, help="SMB port (default: 445)")
 
+    parser.add_argument("--workers", type=int, default=8, help="Parallel SMB connections for ACL checks (default: 8)")
     parser.add_argument("-s", "--shares", nargs="+", metavar="SHARE", help="Specific share(s) to scan")
     parser.add_argument("--all-shares", action="store_true", help="Include hidden/admin shares (ending in $)")
-    parser.add_argument("--depth", type=int, default=None, help="Max recursion depth (default: unlimited)")
+    parser.add_argument("--depth", type=int, default=3, help="Max recursion depth (default: 3, 0=unlimited)")
+    parser.add_argument(
+        "--max-subdirs",
+        type=int,
+        default=10,
+        help="Max subdirs to enter per directory level (default: 10, 0=unlimited)",
+    )
     parser.add_argument("--include-files", action="store_true", help="Also check ACLs on files (slow)")
 
     parser.add_argument(
