@@ -1,9 +1,11 @@
 import argparse
 import ntpath
 import os
+import random
+import string
 import sys
 
-from impacket.dcerpc.v5 import lsad, lsat, rpcrt, samr, srvs, transport
+from impacket.dcerpc.v5 import lsad, lsat, rpcrt, samr, transport
 from impacket.dcerpc.v5.dtypes import MAXIMUM_ALLOWED
 from impacket.dcerpc.v5.lsat import DCERPCSessionError
 from impacket.ldap import ldaptypes
@@ -110,7 +112,7 @@ class SIDResolver:
         resp = lsad.hLsarOpenPolicy2(self._dce, MAXIMUM_ALLOWED | lsat.POLICY_LOOKUP_NAMES)
         return resp["PolicyHandle"]
 
-    def resolve_sids(self, sids: set) -> None:
+    def resolve_sids(self, sids: set[str]) -> None:
         unresolved = [s for s in sids if s not in self.cache]
         if not unresolved:
             return
@@ -408,9 +410,6 @@ def list_shares(conn: SMBConnection) -> list[str]:
 
 
 def test_write_access(conn: SMBConnection, share: str, path: str) -> bool:
-    import random
-    import string
-
     name = "~aclspider_" + "".join(random.choices(string.ascii_lowercase, k=6)) + ".tmp"
     remote_path = ntpath.join(path, name) if path else name
     try:
@@ -431,41 +430,12 @@ def test_write_access(conn: SMBConnection, share: str, path: str) -> bool:
         return False
 
 
-def connect_srvsvc(conn: SMBConnection):
-    try:
-        rt = transport.SMBTransport(
-            conn.getRemoteName(),
-            conn.getRemoteHost(),
-            filename=r"\srvsvc",
-            smb_connection=conn,
-        )
-        dce = rt.get_dce_rpc()
-        dce.connect()
-        dce.bind(srvs.MSRPC_UUID_SRVS)
-        return dce
-    except Exception:
-        return None
-
-
-def get_share_acl_raw(dce_srvsvc, share_name: str) -> bytes | None:
-    try:
-        resp = srvs.hNetrShareGetInfo(dce_srvsvc, share_name, 502)
-        sd_data = resp["InfoStruct"]["ShareInfo502"]["shi502_security_descriptor"]
-        # sd_data is an NDR array; join its bytes
-        raw = b"".join(bytes([b]) for b in sd_data)
-        return raw if raw else None
-    except Exception:
-        return None
-
-
 def walk_share(conn: SMBConnection, share: str, path: str = "", depth: int = 0, max_depth: int | None = None):
     if max_depth is not None and depth > max_depth:
         return
     try:
         pattern = ntpath.join(path, "*") if path else "*"
         entries = conn.listPath(share, pattern)
-    except SessionError:
-        return
     except Exception:
         return
 
@@ -478,10 +448,6 @@ def walk_share(conn: SMBConnection, share: str, path: str = "", depth: int = 0, 
         yield full, is_dir
         if is_dir:
             yield from walk_share(conn, share, full, depth + 1, max_depth)
-
-
-def sid_matches(sid: str, user_sids: set[str]) -> bool:
-    return sid in user_sids
 
 
 def format_ace(ace: dict, resolved: str, is_write: bool, color: bool) -> str:
@@ -542,15 +508,9 @@ def run_spider(args):
             shares = [s for s in shares if s.upper() != "IPC$"]
         print(f"[*] Scanning {len(shares)} share(s): {', '.join(shares)}")
 
-    dce_srvsvc = connect_srvsvc(conn)
-    if dce_srvsvc is None and args.verbose:
-        print("[!] Could not connect to SRVSVC; share-level ACL checks disabled", file=sys.stderr)
-
     found_any = False
 
     for share in shares:
-        share_read_only_sids: set[str] = set()
-
         print(f"\n{'=' * 60}")
         print(f"  Share: {cyan(share, color)}")
         print("  NOTE: only NTFS ACLs shown — use --test-write to confirm actual write access")
@@ -587,31 +547,26 @@ def run_spider(args):
                 if sid in SKIP_SIDS:
                     continue
 
-                if user_sids and not args.no_filter and not sid_matches(sid, user_sids):
+                if user_sids and not args.no_filter and sid not in user_sids:
                     continue
 
                 if args.write_only and not is_write:
                     continue
 
-                blocked_by_share = is_write and sid in share_read_only_sids
-
-                interesting_aces.append((ace, resolved, is_write, blocked_by_share))
+                interesting_aces.append((ace, resolved, is_write))
 
             if interesting_aces:
                 found_any = True
                 write_badge = ""
-                if args.test_write and any(iw for _, _, iw, _ in interesting_aces):
+                if args.test_write and any(iw for _, _, iw in interesting_aces):
                     actually_writable = test_write_access(conn, share, path)
                     if actually_writable:
                         write_badge = f"  {green('[WRITE CONFIRMED]', color)}"
                     else:
                         write_badge = f"  {yellow('[write BLOCKED — likely share-level ACL]', color)}"
                 print(f"\n  {bold(display_path, color)}{write_badge}")
-                for ace, resolved, is_write, blocked_by_share in interesting_aces:
-                    line = format_ace(ace, resolved, is_write, color)
-                    if blocked_by_share:
-                        line += f"  {yellow('[BLOCKED by share-level ACL]', color)}"
-                    print(line)
+                for ace, resolved, is_write in interesting_aces:
+                    print(format_ace(ace, resolved, is_write, color))
 
     if not found_any:
         print("\n[-] No interesting ACLs found with current filters.")
