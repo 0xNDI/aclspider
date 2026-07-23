@@ -119,6 +119,24 @@ def cyan(s: str, color: bool = True) -> str:
     return f"{ANSI_CYAN}{s}{ANSI_RESET}" if color else s
 
 
+def configure_default_authentication(args: argparse.Namespace) -> bool:
+    has_explicit_auth = any(
+        (
+            args.username,
+            args.password,
+            args.hashes,
+            args.kerberos,
+            args.aes_key,
+            args.ccache,
+        )
+    )
+    if has_explicit_auth:
+        return False
+
+    args.username = "guest"
+    return True
+
+
 class SIDResolver:
     def __init__(self, smb_client: SMBConnection):
         self._smb = smb_client
@@ -708,6 +726,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Guest/anonymous access (selected automatically when no credentials are given)
+  aclspider 10.10.11.x --write-only --test-write
+
   # Auto-detect groups via SAMR, show write ACEs only
   aclspider 10.10.11.x -u alice -p 'P@ssw0rd' -d CORP --write-only
 
@@ -763,6 +784,7 @@ Examples:
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
 
     args = parser.parse_args()
+    configure_default_authentication(args)
 
     run_spider(args)
 

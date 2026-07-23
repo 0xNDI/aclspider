@@ -13,6 +13,9 @@ uv tool install git+https://github.com/0xNDI/aclspider
 ## Usage
 
 ```
+# Guest/anonymous access (used automatically when no credentials are supplied)
+aclspider 10.10.11.x --write-only --test-write
+
 # Auto-detect groups via SAMR, show write ACEs only
 aclspider 10.10.11.x -u alice -p 'P@ssw0rd' -d CORP --write-only
 
